@@ -8,6 +8,16 @@ type Profile = {
   deadlift_1rm: number | null
 }
 
+const DAY_LABEL: Record<number, string> = {
+  1: 'Mon',
+  2: 'Tue',
+  3: 'Wed',
+  4: 'Thu',
+  5: 'Fri',
+  6: 'Sat',
+  7: 'Sun',
+}
+
 export default async function PlanPage() {
   const supabase = await createClient()
   const { data: auth } = await supabase.auth.getUser()
@@ -38,13 +48,42 @@ export default async function PlanPage() {
       <div className="card">
         <div className="h1">No active plan</div>
         <p className="p-muted mt-2">Go to onboarding and generate one.</p>
+        <div className="mt-4">
+          <a className="btn" href="/onboarding">
+            Create plan
+          </a>
+        </div>
       </div>
     )
   }
 
+  const { data: gen } = await supabase
+    .from('plan_generation_inputs')
+    .select('days_of_week,duration_weeks,deload_week4,deload_week8,test_week12,weaknesses')
+    .eq('plan_id', plan.id)
+    .maybeSingle()
+
+  const dayLabels =
+    gen?.days_of_week && Array.isArray(gen.days_of_week)
+      ? (gen.days_of_week as number[]).map((d) => DAY_LABEL[d] ?? String(d)).join(', ')
+      : null
+
+  const optionsText = gen
+    ? [
+        dayLabels ? `days: ${dayLabels}` : null,
+        gen.deload_week4 ? 'deload W4' : null,
+        gen.deload_week8 ? 'deload W8' : null,
+        gen.test_week12 ? 'test W12' : null,
+        gen.weaknesses?.length ? `weaknesses: ${(gen.weaknesses as string[]).join(', ')}` : null,
+      ]
+        .filter(Boolean)
+        .join(' • ')
+    : null
+
   const { data: weeks } = await supabase
     .from('plan_weeks')
-    .select(`
+    .select(
+      `
       id,
       week_number,
       workouts (
@@ -60,17 +99,27 @@ export default async function PlanPage() {
           exercise:exercises ( id, name, is_main_lift, base_lift, tracking_mode )
         )
       )
-    `)
+    `
+    )
     .eq('plan_id', plan.id)
     .order('week_number', { ascending: true })
 
   return (
     <div className="space-y-4">
       <div className="card">
-        <div className="h1">Plan Overview</div>
-        <p className="p-muted mt-2">
-          {plan.name} • {plan.duration_weeks} weeks • start {plan.start_date}
-        </p>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="h1">Plan Overview</div>
+            <p className="p-muted mt-2">
+              {plan.name} • {plan.duration_weeks} weeks • start {plan.start_date}
+              {optionsText ? ` • ${optionsText}` : ''}
+            </p>
+          </div>
+
+          <a className="btn" href="/onboarding">
+            Change plan
+          </a>
+        </div>
       </div>
 
       {weeks?.map((w: any) => (
