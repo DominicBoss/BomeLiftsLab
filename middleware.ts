@@ -1,60 +1,75 @@
 import { NextResponse, type NextRequest } from 'next/server'
-import { updateSession } from '@/utils/supabase/middleware'
+import { createServerClient } from '@supabase/ssr'
 
-export async function middleware(request: NextRequest) {
-  const { supabase, response } = await updateSession(request)
+function createSupabaseMiddlewareClient(req: NextRequest) {
+  // We must pass a response so Supabase can set cookies on it.
+  const res = NextResponse.next({ request: { headers: req.headers } })
 
-  const { data: { user } } = await supabase.auth.getUser()
-  const pathname = request.nextUrl.pathname
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return req.cookies.getAll()
+        },
+        setAll(cookiesToSet) {
+          for (const { name, value, options } of cookiesToSet) {
+            res.cookies.set(name, value, options)
+          }
+        },
+      },
+    }
+  )
 
-  const isAuthRoute = pathname.startsWith('/auth')
-  const isPublic =
-    pathname === '/' ||
-    isAuthRoute ||
-    pathname.startsWith('/_next') ||
-    pathname.startsWith('/favicon')
+  return { supabase, res }
+}
 
-  // Nicht eingeloggt -> alles außer public/auth auf /auth/login
-  if (!user && !isPublic) {
-    const url = request.nextUrl.clone()
-    url.pathname = '/auth/login'
+const PROTECTED_PREFIXES = ['/dashboard', '/history', '/plan', '/workout', '/onboarding']
+const AUTH_PREFIX = '/auth'
+
+export async function middleware(req: NextRequest) {
+  const { pathname } = req.nextUrl
+
+  // Always build supabase client in middleware to refresh sessions/cookies
+  const { supabase, res } = createSupabaseMiddlewareClient(req)
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
+  const isLoggedIn = !!user
+  const isAuthRoute = pathname === AUTH_PREFIX || pathname.startsWith(`${AUTH_PREFIX}/`)
+  const isProtectedRoute = PROTECTED_PREFIXES.some((p) => pathname === p || pathname.startsWith(`${p}/`))
+
+  // 1) Root redirect
+  if (pathname === '/') {
+    const url = req.nextUrl.clone()
+    url.pathname = isLoggedIn ? '/dashboard' : '/auth/login'
     return NextResponse.redirect(url)
   }
 
-  // Eingeloggt -> Auth-Seiten blocken (optional, aber sinnvoll)
-  if (user && isAuthRoute) {
-    const url = request.nextUrl.clone()
+  // 2) If logged in, keep them out of /auth/*
+  if (isLoggedIn && isAuthRoute) {
+    const url = req.nextUrl.clone()
     url.pathname = '/dashboard'
     return NextResponse.redirect(url)
   }
 
-  // Eingeloggt -> Onboarding-Check (nur wenn nicht schon auf onboarding)
-  if (user && pathname !== '/onboarding') {
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('squat_1rm, bench_1rm, deadlift_1rm')
-      .eq('id', user.id)
-      .single()
-
-    const onboardingDone =
-      !!profile?.squat_1rm && !!profile?.bench_1rm && !!profile?.deadlift_1rm
-
-    if (!onboardingDone && pathname !== '/onboarding') {
-      const url = request.nextUrl.clone()
-      url.pathname = '/onboarding'
-      return NextResponse.redirect(url)
-    }
+  // 3) If not logged in, block protected routes
+  if (!isLoggedIn && isProtectedRoute) {
+    const url = req.nextUrl.clone()
+    url.pathname = '/auth/login'
+    url.searchParams.set('next', pathname) // optional: redirect back after login
+    return NextResponse.redirect(url)
   }
 
-  return response
+  // Important: return res (not NextResponse.next()) so cookie updates persist
+  return res
 }
 
 export const config = {
   matcher: [
-    /*
-      Middleware läuft auf allem außer statischen assets.
-      Wir lassen /_next/static, /_next/image, favicon etc. aus.
-    */
-    '/((?!_next/static|_next/image|favicon.ico).*)',
+    '/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml).*)',
   ],
 }
