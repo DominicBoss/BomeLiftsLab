@@ -31,11 +31,23 @@ type LogRow = {
   } | null
 }
 
-function currentWeekNumber(startDateStr: string, durationWeeks: number) {
-  const start = new Date(startDateStr + 'T00:00:00')
-  const now = new Date()
-  const diffDays = Math.floor((now.getTime() - start.getTime()) / (1000 * 60 * 60 * 24))
-  const week = Math.floor(diffDays / 7) + 1
+function startOfIsoWeekMonday(d: Date) {
+  // Local time. Monday = 1 ... Sunday = 7
+  const x = new Date(d)
+  x.setHours(0, 0, 0, 0)
+  const day = x.getDay() === 0 ? 7 : x.getDay()
+  x.setDate(x.getDate() - (day - 1))
+  return x
+}
+
+function currentWeekNumber(planStartDateStr: string, durationWeeks: number) {
+  // Week switches at Monday 00:00
+  const planStart = new Date(planStartDateStr + 'T00:00:00')
+  const startMon = startOfIsoWeekMonday(planStart)
+  const nowMon = startOfIsoWeekMonday(new Date())
+  const diffMs = nowMon.getTime() - startMon.getTime()
+  const diffWeeks = Math.floor(diffMs / (1000 * 60 * 60 * 24 * 7))
+  const week = diffWeeks + 1
   return Math.max(1, Math.min(durationWeeks, week))
 }
 
@@ -49,6 +61,14 @@ function dayLabel(planStartDate: string, weekNr: number, dayNumber: number) {
   date.setDate(date.getDate() + (weekNr - 1) * 7 + (dayNumber - 1))
   const names = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const
   return `Day ${dayNumber} (${names[date.getDay()]})`
+}
+
+function dayLabelFromSelectedDays(daysOfWeek: number[] | null | undefined, dayNumber: number) {
+  if (!daysOfWeek || !Array.isArray(daysOfWeek)) return null
+  const d = daysOfWeek[dayNumber - 1]
+  const names: Record<number, string> = { 1: 'Mon', 2: 'Tue', 3: 'Wed', 4: 'Thu', 5: 'Fri', 6: 'Sat', 7: 'Sun' }
+  if (!d || !names[d]) return null
+  return `Day ${dayNumber} (${names[d]})`
 }
 
 export default async function Dashboard() {
@@ -74,6 +94,17 @@ export default async function Dashboard() {
   }
 
   const weekNr = currentWeekNumber(plan.start_date, plan.duration_weeks)
+
+  // Read selected weekdays (Option A mapping: day_number 1..4 maps to days_of_week[0..3])
+  const genRes = await supabase
+    .from('plan_generation_inputs')
+    .select('days_of_week')
+    .eq('plan_id', plan.id)
+    .maybeSingle()
+
+  // keep response as any (no generated types)
+  const gen: any = genRes.data
+  const selectedDays: number[] | null = (gen?.days_of_week ?? null) as any
 
   // ---------------------------
   // THIS WEEK (workouts + exercises)
@@ -108,6 +139,49 @@ export default async function Dashboard() {
   const workouts: WeekWorkout[] = ((week?.workouts ?? []) as any)
     .slice()
     .sort((a: any, b: any) => Number(a.day_number) - Number(b.day_number))
+
+  // ---------------------------
+  // LOGGED STATUS (any set_logs exists for workout_exercises in the workout)
+  // ---------------------------
+  const workoutIds = workouts.map((w) => w.id)
+  const loggedWorkouts = new Set<string>()
+  const workoutProgress = new Map<string, { loggedSets: number; targetSets: number }>()
+
+  if (workoutIds.length > 0) {
+    const wesRes = await supabase
+      .from('workout_exercises')
+      .select('id,workout_id,target_sets')
+      .in('workout_id', workoutIds)
+
+    const wes: { id: string; workout_id: string; target_sets: number }[] = (wesRes.data ?? []) as any
+    const weIdToWorkoutId = new Map<string, string>()
+
+    for (const we of wes) {
+      weIdToWorkoutId.set(we.id, we.workout_id)
+      const cur = workoutProgress.get(we.workout_id) ?? { loggedSets: 0, targetSets: 0 }
+      cur.targetSets += Number(we.target_sets) || 0
+      workoutProgress.set(we.workout_id, cur)
+    }
+
+    const weIds = wes.map((x) => x.id)
+    if (weIds.length > 0) {
+      const logs2Res = await supabase
+        .from('set_logs')
+        .select('workout_exercise_id')
+        .in('workout_exercise_id', weIds)
+        .limit(5000)
+
+      const rows: { workout_exercise_id: string }[] = (logs2Res.data ?? []) as any
+      for (const r of rows) {
+        const wid = weIdToWorkoutId.get(r.workout_exercise_id)
+        if (!wid) continue
+        loggedWorkouts.add(wid)
+        const cur = workoutProgress.get(wid) ?? { loggedSets: 0, targetSets: 0 }
+        cur.loggedSets += 1
+        workoutProgress.set(wid, cur)
+      }
+    }
+  }
 
   // ---------------------------
   // CHART DATA (last 90 days)
@@ -202,6 +276,10 @@ export default async function Dashboard() {
 
         <div className="space-y-2">
           {workouts.map((wo) => {
+            const isAnyLogged = loggedWorkouts.has(wo.id)
+            const prog = workoutProgress.get(wo.id) ?? { loggedSets: 0, targetSets: 0 }
+            const isComplete = prog.targetSets > 0 && prog.loggedSets >= prog.targetSets
+            const isPartial = isAnyLogged && !isComplete
             const lifts = (wo.workout_exercises ?? [])
               .map((x) => x.exercise)
               .filter((ex): ex is NonNullable<typeof ex> => !!ex)
@@ -211,9 +289,30 @@ export default async function Dashboard() {
             const variations = primary ? lifts.filter((ex) => ex.name !== primary.name).map((ex) => ex.name) : []
 
             return (
-              <div key={wo.id} className="border border-white/10 rounded-lg p-3">
+              <div
+                key={wo.id}
+                className={`border rounded-lg p-3 transition-colors ${
+                  isComplete
+                    ? 'border-green-500 bg-green-500/10'
+                    : isPartial
+                      ? 'border-yellow-500/40 bg-yellow-500/5'
+                      : 'border-white/10'
+                }`}
+              >
                 <div className="flex items-center justify-between">
-                  <div className="font-medium">{dayLabel(plan.start_date, weekNr, wo.day_number)}</div>
+                  <div className="font-medium flex items-center gap-2">
+                    {dayLabelFromSelectedDays(selectedDays, wo.day_number) ?? dayLabel(plan.start_date, weekNr, wo.day_number)}
+                    {isComplete && (
+                      <span className="text-xs px-2 py-0.5 rounded-full border border-green-500/40 bg-green-500/10 text-green-300">
+                        ✓ Logged ({Math.min(prog.loggedSets, prog.targetSets)}/{prog.targetSets})
+                      </span>
+                    )}
+                    {isPartial && (
+                      <span className="text-xs px-2 py-0.5 rounded-full border border-yellow-500/40 bg-yellow-500/10 text-yellow-300">
+                        Partial ({prog.loggedSets}/{prog.targetSets || '—'})
+                      </span>
+                    )}
+                  </div>
                   <a className="link" href={`/workout/${wo.id}`}>
                     Open
                   </a>
