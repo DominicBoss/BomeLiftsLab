@@ -1,17 +1,212 @@
 import { supabase } from '@/lib/supabase'
 import { roundTo2_5 } from '@/lib/rounding'
-import { DELOAD_TEMPLATE, getPerformanceBasedWeek, type DayName, type PlanKey, type TemplateBlock } from './planTemplates'
+import type { DayName, PlanKey } from './planTemplates'
+import {
+  blockForWeek,
+  competitionName,
+  findPrimary,
+  findSecondary,
+  findTertiary,
+  getSlotTargets,
+  PROFICIENCY_CAPS,
+  type SlotType,
+  secondaryVariation,
+  tertiaryVariation,
+  type BaseLift,
+  type Proficiency,
+  VARIATION_META,
+} from './staticPlanTables'
 
 type Inputs = {
   userId: string
   plan: PlanKey // only 'PerformanceBased'
-  daysOfWeek: DayName[] // exactly 4
+  daysOfWeek: DayName[] // 3..6
   deloadAfterWeek8: boolean
   deloadAfterWeek10: boolean
   oneRMs: { squat: number; bench: number; deadlift: number } // from profiles
+  proficiency?: Proficiency // default Beginner
 }
 
-type BaseLift = 'squat' | 'bench' | 'deadlift'
+const DAY_TO_NUM: Record<DayName, number> = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 }
+
+function dayNameToNumber(d: DayName) {
+  return DAY_TO_NUM[d]
+}
+
+type SlotItem = { slot: SlotType; lift: BaseLift }
+
+type FatigueTotals = { lower: number; upper: number; overall: number }
+
+function fatigueForExercise(args: { exerciseName: string; sets: number; reps: number; rpe: number }) {
+  const meta = VARIATION_META[args.exerciseName]
+  const base = meta?.fatigueScore ?? 1
+  // This is intentionally simple: it only exists to avoid obviously overloaded days.
+  return base * ((args.sets * args.reps) / 10) * (args.rpe / 10)
+}
+
+function addTotals(t: FatigueTotals, inc: FatigueTotals): FatigueTotals {
+  return { lower: t.lower + inc.lower, upper: t.upper + inc.upper, overall: t.overall + inc.overall }
+}
+
+function withinCaps(t: FatigueTotals, caps: { lowerDailyMax: number; upperDailyMax: number; overallDailyMax: number }) {
+  return t.lower <= caps.lowerDailyMax && t.upper <= caps.upperDailyMax && t.overall <= caps.overallDailyMax
+}
+
+function liftRegion(lift: BaseLift): 'Lower' | 'Upper' {
+  return lift === 'bench' ? 'Upper' : 'Lower'
+}
+
+function fatigueIncrementForSlot(
+  week: number,
+  block: ReturnType<typeof blockForWeek>,
+  slot: SlotType,
+  lift: BaseLift
+): { exName: string; sets: number; reps: number; rpe: number; inc: FatigueTotals } {
+  if (slot === 'primary') {
+    const p = findPrimary(week, lift)
+    const exName = competitionName(lift)
+    const top = fatigueForExercise({ exerciseName: exName, sets: p.top.sets, reps: p.top.reps, rpe: p.top.rpe })
+    const back = p.backoff
+      ? fatigueForExercise({ exerciseName: exName, sets: p.backoff.sets, reps: p.backoff.reps, rpe: p.backoff.rpe })
+      : 0
+    const total = top + back
+    const region = liftRegion(lift)
+    const inc: FatigueTotals = {
+      lower: region === 'Lower' ? total : 0,
+      upper: region === 'Upper' ? total : 0,
+      overall: total,
+    }
+    return { exName, sets: p.top.sets, reps: p.top.reps, rpe: p.top.rpe, inc }
+  }
+  if (slot === 'secondary') {
+    const s = findSecondary(week, lift)
+    const exName = secondaryVariation(block, lift)
+    const total = s.sets > 0 ? fatigueForExercise({ exerciseName: exName, sets: s.sets, reps: s.reps, rpe: s.rpe }) : 0
+    const region = liftRegion(lift)
+    const inc: FatigueTotals = {
+      lower: region === 'Lower' ? total : 0,
+      upper: region === 'Upper' ? total : 0,
+      overall: total,
+    }
+    return { exName, sets: s.sets, reps: s.reps, rpe: s.rpe, inc }
+  }
+  // tertiary
+  const t = findTertiary(week, lift)
+  const exName = tertiaryVariation(lift)
+  const total = t.sets > 0 ? fatigueForExercise({ exerciseName: exName, sets: t.sets, reps: t.reps, rpe: t.rpe }) : 0
+  const region = liftRegion(lift)
+  const inc: FatigueTotals = {
+    lower: region === 'Lower' ? total : 0,
+    upper: region === 'Upper' ? total : 0,
+    overall: total,
+  }
+  return { exName, sets: t.sets, reps: t.reps, rpe: t.rpe, inc }
+}
+
+function buildWeekSchedule(args: { days: 3 | 4 | 5 | 6; proficiency: Proficiency; week: number }): SlotItem[][] {
+  const { days, proficiency, week } = args
+  const block = blockForWeek(week)
+  const targets = getSlotTargets(days, proficiency)
+  const caps = PROFICIENCY_CAPS[proficiency]
+
+  const perDay: SlotItem[][] = Array.from({ length: days }, () => [])
+  const dayFat: FatigueTotals[] = Array.from({ length: days }, () => ({ lower: 0, upper: 0, overall: 0 }))
+  const weekFat: FatigueTotals = { lower: 0, upper: 0, overall: 0 }
+
+  const maxSlotsPerDay = 2
+
+  const place = (item: SlotItem) => {
+    const candidates = [...Array(days).keys()]
+      .filter((i) => perDay[i].length < maxSlotsPerDay)
+      .sort((a, b) => perDay[a].length - perDay[b].length)
+
+    const { inc } = fatigueIncrementForSlot(week, block, item.slot, item.lift)
+
+    const tryOrder = (xs: number[]) => {
+      for (const i of xs) {
+        const hasSameLift = perDay[i].some((x) => x.lift === item.lift)
+        if (hasSameLift && days >= 4) continue
+
+        const newDay = addTotals(dayFat[i], inc)
+        const newWeek = addTotals(weekFat, inc)
+
+        const dailyOk = withinCaps(newDay, caps)
+        const weeklyOk =
+          newWeek.lower <= caps.lowerWeeklyMax && newWeek.upper <= caps.upperWeeklyMax && newWeek.overall <= caps.overallWeeklyMax
+
+        if (dailyOk && weeklyOk) {
+          perDay[i].push(item)
+          dayFat[i] = newDay
+          weekFat.lower = newWeek.lower
+          weekFat.upper = newWeek.upper
+          weekFat.overall = newWeek.overall
+          return true
+        }
+      }
+      return false
+    }
+
+    if (tryOrder(candidates)) return
+
+    // Fallback: deterministic least-bad
+    let bestIdx = candidates[0] ?? 0
+    let bestScore = Number.POSITIVE_INFINITY
+    for (const i of candidates) {
+      const newDay = addTotals(dayFat[i], inc)
+      const overload =
+        Math.max(0, newDay.lower - caps.lowerDailyMax) +
+        Math.max(0, newDay.upper - caps.upperDailyMax) +
+        Math.max(0, newDay.overall - caps.overallDailyMax)
+      const hasSameLift = perDay[i].some((x) => x.lift === item.lift) ? 0.5 : 0
+      const score = overload + hasSameLift + perDay[i].length * 0.1
+      if (score < bestScore) {
+        bestScore = score
+        bestIdx = i
+      }
+    }
+    perDay[bestIdx].push(item)
+    dayFat[bestIdx] = addTotals(dayFat[bestIdx], inc)
+    weekFat.lower += inc.lower
+    weekFat.upper += inc.upper
+    weekFat.overall += inc.overall
+  }
+
+  const evenlySpacedDays = (count: number) => {
+    const res: number[] = []
+    for (let i = 0; i < count; i++) {
+      const idx = Math.floor(((i + 0.5) * days) / count)
+      res.push(Math.min(days - 1, Math.max(0, idx)))
+    }
+    return res
+  }
+
+  // Primaries first
+  ;(['squat', 'bench', 'deadlift'] as BaseLift[]).forEach((lift) => {
+    const count = targets[lift].primary
+    const positions = evenlySpacedDays(count)
+    for (let i = 0; i < count; i++) place({ slot: 'primary', lift })
+  })
+
+  // Secondaries
+  ;(['bench', 'squat', 'deadlift'] as BaseLift[]).forEach((lift) => {
+    const count = targets[lift].secondary
+    for (let i = 0; i < count; i++) place({ slot: 'secondary', lift })
+  })
+
+  // Tertiaries (skip peak)
+  if (block !== 'Peak') {
+    ;(['bench', 'squat', 'deadlift'] as BaseLift[]).forEach((lift) => {
+      const count = targets[lift].tertiary
+      for (let i = 0; i < count; i++) place({ slot: 'tertiary', lift })
+    })
+  }
+
+  // Sort within day
+  const order: Record<SlotType, number> = { primary: 0, secondary: 1, tertiary: 2 }
+  for (const d of perDay) d.sort((a, b) => order[a.slot] - order[b.slot])
+
+  return perDay
+}
 
 function kFactor(lift: BaseLift) {
   if (lift === 'squat') return 30
@@ -31,7 +226,6 @@ function plannedWeightFrom1RM(oneRm: number, reps: number, rpe: number, lift: Ba
 }
 
 async function getMainLiftExerciseIds() {
-  // robust: do NOT rely on names. Use base_lift + is_main_lift.
   const { data, error } = await supabase
     .from('exercises')
     .select('id, base_lift, is_main_lift')
@@ -53,6 +247,58 @@ async function getMainLiftExerciseIds() {
   return map
 }
 
+async function getOrCreateExerciseId(args: {
+  name: string
+  base_lift: BaseLift | 'other'
+  is_main_lift: boolean
+  tracking_mode: 'e1rm' | 'volume' | 'none'
+}) {
+  const { name, base_lift, is_main_lift, tracking_mode } = args
+
+  const { data: existing, error: qErr } = await supabase
+    .from('exercises')
+    .select('id')
+    .eq('name', name)
+    .eq('base_lift', base_lift)
+    .limit(1)
+
+  if (qErr) throw new Error(qErr.message)
+  if (existing?.[0]?.id) return existing[0].id as string
+
+  const { data: inserted, error: iErr } = await supabase
+    .from('exercises')
+    .insert({ name, base_lift, is_main_lift, tracking_mode })
+    .select('id')
+    .single()
+
+  if (iErr) throw new Error(iErr.message)
+  return inserted.id as string
+}
+
+async function ensureStaticExercisesExist() {
+  await getOrCreateExerciseId({ name: 'Competition Squat', base_lift: 'squat', is_main_lift: true, tracking_mode: 'e1rm' })
+  await getOrCreateExerciseId({ name: 'Competition Bench', base_lift: 'bench', is_main_lift: true, tracking_mode: 'e1rm' })
+  await getOrCreateExerciseId({ name: 'Competition Deadlift', base_lift: 'deadlift', is_main_lift: true, tracking_mode: 'e1rm' })
+
+  const vars: Array<{ name: string; base_lift: BaseLift; tracking_mode: 'e1rm' | 'volume' | 'none' }> = [
+    { name: 'Paused Squat', base_lift: 'squat', tracking_mode: 'e1rm' },
+    { name: 'Pin Squat (Mid)', base_lift: 'squat', tracking_mode: 'e1rm' },
+    { name: 'Tempo Squat', base_lift: 'squat', tracking_mode: 'volume' },
+
+    { name: 'Paused Bench', base_lift: 'bench', tracking_mode: 'e1rm' },
+    { name: 'Pin Press', base_lift: 'bench', tracking_mode: 'e1rm' },
+    { name: 'Tempo Bench', base_lift: 'bench', tracking_mode: 'volume' },
+
+    { name: 'RDL', base_lift: 'deadlift', tracking_mode: 'e1rm' },
+    { name: 'Paused Deadlift', base_lift: 'deadlift', tracking_mode: 'e1rm' },
+    { name: 'Hip Thrust', base_lift: 'deadlift', tracking_mode: 'volume' },
+  ]
+
+  for (const v of vars) {
+    await getOrCreateExerciseId({ name: v.name, base_lift: v.base_lift, is_main_lift: false, tracking_mode: v.tracking_mode })
+  }
+}
+
 export async function generatePlanInDb({
   userId,
   plan,
@@ -60,22 +306,24 @@ export async function generatePlanInDb({
   deloadAfterWeek8,
   deloadAfterWeek10,
   oneRMs,
+  proficiency = 'Beginner',
 }: Inputs) {
   if (plan !== 'PerformanceBased') throw new Error('Invalid plan')
-  if (!Array.isArray(daysOfWeek) || daysOfWeek.length !== 4) throw new Error('Select exactly 4 training days.')
+  if (!Array.isArray(daysOfWeek) || daysOfWeek.length < 3 || daysOfWeek.length > 6)
+    throw new Error('Select between 3 and 6 training days.')
+  if (proficiency !== 'Beginner' && proficiency !== 'Advanced') throw new Error('Invalid proficiency')
 
-  // 1) deactivate old active plans
+  await ensureStaticExercisesExist()
+
   await supabase
     .from('plans')
     .update({ is_active: false })
     .eq('user_id', userId)
     .eq('is_active', true)
 
-  // Plan length in UI sense stays 10, but stored duration should reflect chronological sequence
   const deloadCount = (deloadAfterWeek8 ? 1 : 0) + (deloadAfterWeek10 ? 1 : 0)
   const durationWeeks = 10 + deloadCount
 
-  // 2) create new plan
   const { data: planRow, error: planErr } = await supabase
     .from('plans')
     .insert({
@@ -90,21 +338,19 @@ export async function generatePlanInDb({
   if (planErr) throw new Error(planErr.message)
   const planId = planRow.id as string
 
-  // 3) persist inputs
   await supabase.from('plan_generation_inputs').insert({
     plan_id: planId,
-    days_of_week: daysOfWeek,
+    // DB uses weekday numbers 1..7
+    days_of_week: daysOfWeek.map(dayNameToNumber),
     duration_weeks: 10,
-    deload_week4: false, // legacy field exists; keep false
-    deload_week8: false, // legacy field exists; keep false
-    test_week12: false,  // legacy; keep false
+    deload_week4: false,
+    deload_week8: false,
+    test_week12: false,
     maxes: { squat: oneRMs.squat, bench: oneRMs.bench, deadlift: oneRMs.deadlift },
-    weaknesses: [],
-    // add your new flags in a follow-up migration if you want; for now, store them in weaknesses or maxes if needed
+    weaknesses: [`proficiency:${proficiency}`, `frequencyDays:${daysOfWeek.length}`, 'generator:static10w:v2'],
   })
 
   const exIds = await getMainLiftExerciseIds()
-
   let sequence = 1
 
   const insertWeek = async (week_number: number, is_deload: boolean) => {
@@ -139,57 +385,110 @@ export async function generatePlanInDb({
     return woRow.id as string
   }
 
-  const insertBlocks = async (workoutId: string, blocks: TemplateBlock[]) => {
-    const payload = blocks.map((b) => {
-      const lift = b.base_lift
-      const exId = exIds.get(lift)!
-      const oneRm = lift === 'squat' ? oneRMs.squat : lift === 'bench' ? oneRMs.bench : oneRMs.deadlift
+  const insertExerciseRow = async (args: {
+    workoutId: string
+    exerciseName: string
+    baseLift: BaseLift
+    sets: number
+    reps: number
+    rpe: number
+  }) => {
+    if (args.sets <= 0 || args.reps <= 0 || args.rpe <= 0) return
 
-      const planned = plannedWeightFrom1RM(oneRm, b.reps, b.rpe, lift)
+    const isComp = args.exerciseName === competitionName(args.baseLift)
+    const trackingMode: 'e1rm' | 'volume' | 'none' =
+      args.exerciseName.includes('Tempo') || args.exerciseName === 'Hip Thrust' ? 'volume' : 'e1rm'
 
-      return {
-        workout_id: workoutId,
-        exercise_id: exId,
-        target_sets: b.sets,
-        target_reps: b.reps,
-        target_percentage: null,
-        target_rpe: b.rpe,
-        planned_weight: planned,
-      }
+    const exId = isComp
+      ? exIds.get(args.baseLift)!
+      : await getOrCreateExerciseId({
+          name: args.exerciseName,
+          base_lift: args.baseLift,
+          is_main_lift: false,
+          tracking_mode: trackingMode,
+        })
+
+    const oneRm =
+      args.baseLift === 'squat' ? oneRMs.squat : args.baseLift === 'bench' ? oneRMs.bench : oneRMs.deadlift
+
+    const planned = plannedWeightFrom1RM(oneRm, args.reps, args.rpe, args.baseLift)
+
+    const { error } = await supabase.from('workout_exercises').insert({
+      workout_id: args.workoutId,
+      exercise_id: exId,
+      target_sets: args.sets,
+      target_reps: args.reps,
+      target_percentage: null,
+      target_rpe: args.rpe,
+      planned_weight: planned,
     })
-
-    const { error } = await supabase.from('workout_exercises').insert(payload)
     if (error) throw new Error(error.message)
   }
 
-  // 4) weeks 1..10 with optional deload insertions
+  const dayCount = daysOfWeek.length as 3 | 4 | 5 | 6
+
   for (let week = 1; week <= 10; week++) {
     const weekId = await insertWeek(week, false)
+    const block = blockForWeek(week)
+    const weekSchedule = buildWeekSchedule({ days: dayCount, proficiency, week })
 
-    const tmpl = getPerformanceBasedWeek(week)
-    for (const day of tmpl.days) {
-      const dayName = daysOfWeek[day.dayIndex - 1]
-      const workoutId = await insertDay(weekId, day.dayIndex, dayName)
-      await insertBlocks(workoutId, day.blocks)
-    }
+    for (let dayIndex = 1; dayIndex <= dayCount; dayIndex++) {
+      const dayName = daysOfWeek[dayIndex - 1]
+      const workoutId = await insertDay(weekId, dayIndex, dayName)
 
-    if (week === 8 && deloadAfterWeek8) {
-      const deloadWeekId = await insertWeek(8, true)
-      for (const d of DELOAD_TEMPLATE) {
-        const dayName = daysOfWeek[d.dayIndex - 1]
-        const workoutId = await insertDay(deloadWeekId, d.dayIndex, dayName)
-        await insertBlocks(workoutId, d.blocks)
+      for (const item of weekSchedule[dayIndex - 1]) {
+        const lift = item.lift
+        const slot = item.slot
+
+        if (slot === 'primary') {
+          const p = findPrimary(week, lift)
+          const exName = competitionName(lift)
+          await insertExerciseRow({ workoutId, exerciseName: exName, baseLift: lift, sets: p.top.sets, reps: p.top.reps, rpe: p.top.rpe })
+          if (p.backoff) {
+            await insertExerciseRow({ workoutId, exerciseName: exName, baseLift: lift, sets: p.backoff.sets, reps: p.backoff.reps, rpe: p.backoff.rpe })
+          }
+        }
+
+        if (slot === 'secondary') {
+          const s = findSecondary(week, lift)
+          if (s.sets <= 0) continue
+          if (block === 'Peak' && lift === 'deadlift') continue
+          const exName = secondaryVariation(block, lift)
+          await insertExerciseRow({ workoutId, exerciseName: exName, baseLift: lift, sets: s.sets, reps: s.reps, rpe: s.rpe })
+        }
+
+        if (slot === 'tertiary') {
+          const t = findTertiary(week, lift)
+          if (t.sets <= 0) continue
+          if (block === 'Peak') continue
+          const exName = tertiaryVariation(lift)
+          await insertExerciseRow({ workoutId, exerciseName: exName, baseLift: lift, sets: t.sets, reps: t.reps, rpe: t.rpe })
+        }
       }
     }
 
-    if (week === 10 && deloadAfterWeek10) {
-      const deloadWeekId = await insertWeek(10, true)
-      for (const d of DELOAD_TEMPLATE) {
-        const dayName = daysOfWeek[d.dayIndex - 1]
-        const workoutId = await insertDay(deloadWeekId, d.dayIndex, dayName)
-        await insertBlocks(workoutId, d.blocks)
+    const insertDeloadWeek = async (labelWeek: number) => {
+      const deloadWeekId = await insertWeek(labelWeek, true)
+      for (let dayIndex = 1; dayIndex <= dayCount; dayIndex++) {
+        const dayName = daysOfWeek[dayIndex - 1]
+        const workoutId = await insertDay(deloadWeekId, dayIndex, dayName)
+
+        const mod = (dayIndex - 1) % 3
+        if (mod === 0) {
+          await insertExerciseRow({ workoutId, exerciseName: competitionName('squat'), baseLift: 'squat', sets: 3, reps: 3, rpe: 6 })
+          await insertExerciseRow({ workoutId, exerciseName: competitionName('bench'), baseLift: 'bench', sets: 3, reps: 4, rpe: 6 })
+        } else if (mod === 1) {
+          await insertExerciseRow({ workoutId, exerciseName: competitionName('bench'), baseLift: 'bench', sets: 3, reps: 3, rpe: 6 })
+          await insertExerciseRow({ workoutId, exerciseName: competitionName('deadlift'), baseLift: 'deadlift', sets: 2, reps: 3, rpe: 6 })
+        } else {
+          await insertExerciseRow({ workoutId, exerciseName: competitionName('squat'), baseLift: 'squat', sets: 2, reps: 3, rpe: 6 })
+          await insertExerciseRow({ workoutId, exerciseName: competitionName('bench'), baseLift: 'bench', sets: 2, reps: 3, rpe: 6 })
+        }
       }
     }
+
+    if (week === 8 && deloadAfterWeek8) await insertDeloadWeek(8)
+    if (week === 10 && deloadAfterWeek10) await insertDeloadWeek(10)
   }
 
   return planId
