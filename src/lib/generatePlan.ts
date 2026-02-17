@@ -9,11 +9,11 @@ import {
   findTertiary,
   getSlotTargets,
   PROFICIENCY_CAPS,
-  type SlotType,
   secondaryVariation,
   tertiaryVariation,
   type BaseLift,
   type Proficiency,
+  type SlotType,
   VARIATION_META,
 } from './staticPlanTables'
 
@@ -28,21 +28,12 @@ type Inputs = {
 }
 
 const DAY_TO_NUM: Record<DayName, number> = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 }
-
 function dayNameToNumber(d: DayName) {
   return DAY_TO_NUM[d]
 }
 
 type SlotItem = { slot: SlotType; lift: BaseLift }
-
 type FatigueTotals = { lower: number; upper: number; overall: number }
-
-function fatigueForExercise(args: { exerciseName: string; sets: number; reps: number; rpe: number }) {
-  const meta = VARIATION_META[args.exerciseName]
-  const base = meta?.fatigueScore ?? 1
-  // simple heuristic: only to avoid obviously overloaded days
-  return base * ((args.sets * args.reps) / 10) * (args.rpe / 10)
-}
 
 function addTotals(t: FatigueTotals, inc: FatigueTotals): FatigueTotals {
   return { lower: t.lower + inc.lower, upper: t.upper + inc.upper, overall: t.overall + inc.overall }
@@ -56,55 +47,98 @@ function liftRegion(lift: BaseLift): 'Lower' | 'Upper' {
   return lift === 'bench' ? 'Upper' : 'Lower'
 }
 
-function fatigueIncrementForSlot(
-  week: number,
-  block: ReturnType<typeof blockForWeek>,
-  slot: SlotType,
-  lift: BaseLift
-): { exName: string; sets: number; reps: number; rpe: number; inc: FatigueTotals } {
+// --- very simple fatigue heuristic: only to prevent obviously overloaded days ---
+function fatigueForExercise(args: { exerciseName: string; sets: number; reps: number; rpe: number }) {
+  const meta = VARIATION_META[args.exerciseName]
+  const base = meta?.fatigueScore ?? 1
+  return base * ((args.sets * args.reps) / 10) * (args.rpe / 10)
+}
+
+// ---------------- Engine helpers (deterministic, block-aware) ----------------
+
+function maxSlotsPerDay(days: 3 | 4 | 5 | 6) {
+  if (days === 3) return 3
+  if (days === 4) return 3
+  return 2
+}
+
+function blockMultiplier(block: ReturnType<typeof blockForWeek>) {
+  if (block === 'Volume') return 1.0
+  if (block === 'Strength') return 1.15
+  return 1.25 // Peak
+}
+
+function slotMultiplier(slot: SlotType) {
+  if (slot === 'primary') return 1.2
+  if (slot === 'secondary') return 1.0
+  return 0.8
+}
+
+function estimateSlotFatigue(week: number, slot: SlotType, lift: BaseLift) {
+  const block = blockForWeek(week)
+  const mul = blockMultiplier(block) * slotMultiplier(slot)
+
   if (slot === 'primary') {
     const p = findPrimary(week, lift)
     const exName = competitionName(lift)
-
     const top = fatigueForExercise({ exerciseName: exName, sets: p.top.sets, reps: p.top.reps, rpe: p.top.rpe })
     const back = p.backoff
       ? fatigueForExercise({ exerciseName: exName, sets: p.backoff.sets, reps: p.backoff.reps, rpe: p.backoff.rpe })
       : 0
-
-    const total = top + back
-    const region = liftRegion(lift)
-    const inc: FatigueTotals = {
-      lower: region === 'Lower' ? total : 0,
-      upper: region === 'Upper' ? total : 0,
-      overall: total,
-    }
-    return { exName, sets: p.top.sets, reps: p.top.reps, rpe: p.top.rpe, inc }
+    return (top + back) * mul
   }
 
   if (slot === 'secondary') {
     const s = findSecondary(week, lift)
+    if (s.sets <= 0) return 0
     const exName = secondaryVariation(block, lift)
-    const total = s.sets > 0 ? fatigueForExercise({ exerciseName: exName, sets: s.sets, reps: s.reps, rpe: s.rpe }) : 0
-    const region = liftRegion(lift)
-    const inc: FatigueTotals = {
-      lower: region === 'Lower' ? total : 0,
-      upper: region === 'Upper' ? total : 0,
-      overall: total,
-    }
-    return { exName, sets: s.sets, reps: s.reps, rpe: s.rpe, inc }
+    return fatigueForExercise({ exerciseName: exName, sets: s.sets, reps: s.reps, rpe: s.rpe }) * mul
   }
 
-  // tertiary
   const t = findTertiary(week, lift)
+  if (t.sets <= 0) return 0
   const exName = tertiaryVariation(lift)
-  const total = t.sets > 0 ? fatigueForExercise({ exerciseName: exName, sets: t.sets, reps: t.reps, rpe: t.rpe }) : 0
-  const region = liftRegion(lift)
-  const inc: FatigueTotals = {
-    lower: region === 'Lower' ? total : 0,
-    upper: region === 'Upper' ? total : 0,
-    overall: total,
+  return fatigueForExercise({ exerciseName: exName, sets: t.sets, reps: t.reps, rpe: t.rpe }) * mul
+}
+
+function violatesHardRules(args: {
+  block: ReturnType<typeof blockForWeek>
+  days: 3 | 4 | 5 | 6
+  daySlots: SlotItem[]
+  candidate: SlotItem
+}) {
+  const { block, days, daySlots, candidate } = args
+
+  const has = (lift: BaseLift, slot?: SlotType) =>
+    daySlots.some((x) => x.lift === lift && (slot ? x.slot === slot : true))
+
+  // Never: SQ primary + DL primary same day
+  if (candidate.slot === 'primary') {
+    if (candidate.lift === 'squat' && has('deadlift', 'primary')) return true
+    if (candidate.lift === 'deadlift' && has('squat', 'primary')) return true
+  } else {
+    // In Strength/Peak: keep DL secondary/tertiary away from SQ primary
+    if ((block === 'Strength' || block === 'Peak') && has('squat', 'primary') && candidate.lift === 'deadlift') {
+      if (candidate.slot === 'secondary') return true
+      if (candidate.slot === 'tertiary') return true
+    }
+    // In Strength/Peak: avoid SQ secondary on DL primary day
+    if ((block === 'Strength' || block === 'Peak') && has('deadlift', 'primary') && candidate.lift === 'squat') {
+      if (candidate.slot === 'secondary') return true
+    }
   }
-  return { exName, sets: t.sets, reps: t.reps, rpe: t.rpe, inc }
+
+  // Same-lift stacking:
+  // For 4+ days: avoid repeating same lift on same day (bench is the only partial exception)
+  if (days >= 4) {
+    const sameLift = daySlots.some((x) => x.lift === candidate.lift)
+    if (sameLift) {
+      if (candidate.lift !== 'bench') return true
+      if (candidate.slot === 'primary') return true
+    }
+  }
+
+  return false
 }
 
 function buildWeekSchedule(args: { days: 3 | 4 | 5 | 6; proficiency: Proficiency; week: number }): SlotItem[][] {
@@ -112,96 +146,157 @@ function buildWeekSchedule(args: { days: 3 | 4 | 5 | 6; proficiency: Proficiency
   const block = blockForWeek(week)
   const targets = getSlotTargets(days, proficiency)
   const caps = PROFICIENCY_CAPS[proficiency]
+  const capPerDay = maxSlotsPerDay(days)
 
   const perDay: SlotItem[][] = Array.from({ length: days }, () => [])
   const dayFat: FatigueTotals[] = Array.from({ length: days }, () => ({ lower: 0, upper: 0, overall: 0 }))
   const weekFat: FatigueTotals = { lower: 0, upper: 0, overall: 0 }
 
-  const maxSlotsPerDay = 2
-
-  const place = (item: SlotItem) => {
-    const candidates = [...Array(days).keys()]
-      .filter((i) => perDay[i].length < maxSlotsPerDay)
-      .sort((a, b) => perDay[a].length - perDay[b].length)
-
-    const { inc } = fatigueIncrementForSlot(week, block, item.slot, item.lift)
-
-    const tryOrder = (xs: number[]) => {
-      for (const i of xs) {
-        const hasSameLift = perDay[i].some((x) => x.lift === item.lift)
-        if (hasSameLift && days >= 4) continue
-
-        const newDay = addTotals(dayFat[i], inc)
-        const newWeek = addTotals(weekFat, inc)
-
-        const dailyOk = withinCaps(newDay, caps)
-        const weeklyOk =
-          newWeek.lower <= caps.lowerWeeklyMax && newWeek.upper <= caps.upperWeeklyMax && newWeek.overall <= caps.overallWeeklyMax
-
-        if (dailyOk && weeklyOk) {
-          perDay[i].push(item)
-          dayFat[i] = newDay
-          weekFat.lower = newWeek.lower
-          weekFat.upper = newWeek.upper
-          weekFat.overall = newWeek.overall
-          return true
-        }
-      }
-      return false
+  const addFat = (idx: number, lift: BaseLift, amount: number) => {
+    const region = liftRegion(lift)
+    const inc: FatigueTotals = {
+      lower: region === 'Lower' ? amount : 0,
+      upper: region === 'Upper' ? amount : 0,
+      overall: amount,
     }
-
-    if (tryOrder(candidates)) return
-
-    // Fallback: deterministic least-bad
-    let bestIdx = candidates[0] ?? 0
-    let bestScore = Number.POSITIVE_INFINITY
-    for (const i of candidates) {
-      const newDay = addTotals(dayFat[i], inc)
-      const overload =
-        Math.max(0, newDay.lower - caps.lowerDailyMax) +
-        Math.max(0, newDay.upper - caps.upperDailyMax) +
-        Math.max(0, newDay.overall - caps.overallDailyMax)
-      const hasSameLift = perDay[i].some((x) => x.lift === item.lift) ? 0.5 : 0
-      const score = overload + hasSameLift + perDay[i].length * 0.1
-      if (score < bestScore) {
-        bestScore = score
-        bestIdx = i
-      }
-    }
-
-    perDay[bestIdx].push(item)
-    dayFat[bestIdx] = addTotals(dayFat[bestIdx], inc)
+    dayFat[idx] = addTotals(dayFat[idx], inc)
     weekFat.lower += inc.lower
     weekFat.upper += inc.upper
     weekFat.overall += inc.overall
   }
 
-  // Primaries first
-  ;(['squat', 'bench', 'deadlift'] as BaseLift[]).forEach((lift) => {
-    const count = targets[lift].primary
-    for (let i = 0; i < count; i++) place({ slot: 'primary', lift })
-  })
+  // Score placement. Lower = better. INF = forbidden.
+  const scorePlacement = (dayIdx: number, item: SlotItem) => {
+    if (perDay[dayIdx].length >= capPerDay) return Number.POSITIVE_INFINITY
+    if (violatesHardRules({ block, days, daySlots: perDay[dayIdx], candidate: item })) return Number.POSITIVE_INFINITY
 
-  // Secondaries
-  ;(['bench', 'squat', 'deadlift'] as BaseLift[]).forEach((lift) => {
-    const count = targets[lift].secondary
-    for (let i = 0; i < count; i++) place({ slot: 'secondary', lift })
-  })
+    const slotFat = estimateSlotFatigue(week, item.slot, item.lift)
+    const region = liftRegion(item.lift)
 
-  // Tertiaries (skip peak)
-  if (block !== 'Peak') {
-    ;(['bench', 'squat', 'deadlift'] as BaseLift[]).forEach((lift) => {
-      const count = targets[lift].tertiary
-      for (let i = 0; i < count; i++) place({ slot: 'tertiary', lift })
+    const newDay = addTotals(dayFat[dayIdx], {
+      lower: region === 'Lower' ? slotFat : 0,
+      upper: region === 'Upper' ? slotFat : 0,
+      overall: slotFat,
     })
+
+    // Daily caps = hard
+    const dailyOver =
+      Math.max(0, newDay.lower - caps.lowerDailyMax) +
+      Math.max(0, newDay.upper - caps.upperDailyMax) +
+      Math.max(0, newDay.overall - caps.overallDailyMax)
+
+    if (dailyOver > 0) return Number.POSITIVE_INFINITY
+
+    // Weekly caps = soft penalties
+    const newWeek = addTotals(weekFat, {
+      lower: region === 'Lower' ? slotFat : 0,
+      upper: region === 'Upper' ? slotFat : 0,
+      overall: slotFat,
+    })
+
+    const weeklyOver =
+      Math.max(0, newWeek.lower - caps.lowerWeeklyMax) +
+      Math.max(0, newWeek.upper - caps.upperWeeklyMax) +
+      Math.max(0, newWeek.overall - caps.overallWeeklyMax)
+
+    // Balance preference: avoid stuffing already-heavy days
+    const balancePenalty = dayFat[dayIdx].overall * 0.15 + perDay[dayIdx].length * 0.25
+
+    // Soft: keep squat and deadlift apart in Strength/Peak
+    let interactionPenalty = 0
+    if (block !== 'Volume') {
+      const hasSQ = perDay[dayIdx].some((x) => x.lift === 'squat')
+      const hasDL = perDay[dayIdx].some((x) => x.lift === 'deadlift')
+      if ((item.lift === 'deadlift' && hasSQ) || (item.lift === 'squat' && hasDL)) interactionPenalty += 0.75
+    }
+
+    // Deterministic tiny bias: put primaries earlier
+    const orderingPenalty = item.slot === 'primary' ? dayIdx * 0.05 : 0
+
+    return weeklyOver * 2.0 + balancePenalty + interactionPenalty + orderingPenalty
   }
 
-  // Sort within day
+  const placeOne = (item: SlotItem) => {
+    let bestIdx = 0
+    let bestScore = Number.POSITIVE_INFINITY
+
+    for (let i = 0; i < days; i++) {
+      const s = scorePlacement(i, item)
+      if (s < bestScore) {
+        bestScore = s
+        bestIdx = i
+      }
+    }
+
+    // Emergency fallback for 3-day: relax same-lift stacking (but still forbid SQP+DLP)
+    if (!Number.isFinite(bestScore) && days === 3) {
+      for (let i = 0; i < days; i++) {
+        if (perDay[i].length >= capPerDay) continue
+
+        const primaries = perDay[i].filter((x) => x.slot === 'primary').map((x) => x.lift)
+        if (item.slot === 'primary' && item.lift === 'squat' && primaries.includes('deadlift')) continue
+        if (item.slot === 'primary' && item.lift === 'deadlift' && primaries.includes('squat')) continue
+
+        const slotFat = estimateSlotFatigue(week, item.slot, item.lift)
+        const region = liftRegion(item.lift)
+        const newDay = addTotals(dayFat[i], {
+          lower: region === 'Lower' ? slotFat : 0,
+          upper: region === 'Upper' ? slotFat : 0,
+          overall: slotFat,
+        })
+
+        const dailyOver =
+          Math.max(0, newDay.lower - caps.lowerDailyMax) +
+          Math.max(0, newDay.upper - caps.upperDailyMax) +
+          Math.max(0, newDay.overall - caps.overallDailyMax)
+
+        if (dailyOver > 0) continue
+
+        perDay[i].push(item)
+        addFat(i, item.lift, slotFat)
+        return
+      }
+    }
+
+    // Normal place (assumes at least one valid day exists)
+    const slotFat = estimateSlotFatigue(week, item.slot, item.lift)
+    perDay[bestIdx].push(item)
+    addFat(bestIdx, item.lift, slotFat)
+  }
+
+  // Build required slots list (deterministic, block-aware)
+  const required: SlotItem[] = []
+
+  const primaryOrder: BaseLift[] =
+    block === 'Volume' ? (['bench', 'squat', 'deadlift'] as BaseLift[]) : (['squat', 'bench', 'deadlift'] as BaseLift[])
+
+  for (const lift of primaryOrder) {
+    for (let i = 0; i < targets[lift].primary; i++) required.push({ slot: 'primary', lift })
+  }
+
+  const secondaryOrder: BaseLift[] = ['bench', 'squat', 'deadlift']
+  for (const lift of secondaryOrder) {
+    for (let i = 0; i < targets[lift].secondary; i++) required.push({ slot: 'secondary', lift })
+  }
+
+  if (block !== 'Peak') {
+    const tertiaryOrder: BaseLift[] = ['bench', 'squat', 'deadlift']
+    for (const lift of tertiaryOrder) {
+      for (let i = 0; i < targets[lift].tertiary; i++) required.push({ slot: 'tertiary', lift })
+    }
+  }
+
+  // Place all slots
+  for (const item of required) placeOne(item)
+
+  // Sort inside day: primary -> secondary -> tertiary
   const order: Record<SlotType, number> = { primary: 0, secondary: 1, tertiary: 2 }
   for (const d of perDay) d.sort((a, b) => order[a.slot] - order[b.slot])
 
   return perDay
 }
+
+// ---------------- Planned weight ----------------
 
 function kFactor(lift: BaseLift) {
   if (lift === 'squat') return 30
@@ -219,6 +314,8 @@ function plannedWeightFrom1RM(oneRm: number, reps: number, rpe: number, lift: Ba
   const denom = 1 + (reps + rir) / k
   return roundTo2_5(oneRm / denom)
 }
+
+// ---------------- DB helpers (READ-ONLY exercises) ----------------
 
 async function getMainLiftExerciseIds() {
   const { data, error } = await supabase
@@ -242,7 +339,6 @@ async function getMainLiftExerciseIds() {
   return map
 }
 
-// ---- READ-ONLY exercises lookup (NO inserts; avoids RLS issues) ----
 async function getExerciseIdOrThrow(name: string, base_lift: BaseLift) {
   const { data, error } = await supabase
     .from('exercises')
@@ -286,6 +382,8 @@ async function ensureStaticExercisesExist() {
   }
 }
 
+// ---------------- Main entry ----------------
+
 export async function generatePlanInDb({
   userId,
   plan,
@@ -300,7 +398,7 @@ export async function generatePlanInDb({
     throw new Error('Select between 3 and 6 training days.')
   if (proficiency !== 'Beginner' && proficiency !== 'Advanced') throw new Error('Invalid proficiency')
 
-  // Read-only check: fails fast if you forgot to seed exercises table
+  // Read-only check to avoid RLS issues
   await ensureStaticExercisesExist()
 
   // deactivate old plans
@@ -327,7 +425,7 @@ export async function generatePlanInDb({
   if (planErr) throw new Error(planErr.message)
   const planId = planRow.id as string
 
-  // store generation metadata (keep DB as weekday numbers 1..7)
+  // store generation metadata (keep DB weekday numbers 1..7)
   await supabase.from('plan_generation_inputs').insert({
     plan_id: planId,
     days_of_week: daysOfWeek.map(dayNameToNumber),
@@ -336,7 +434,7 @@ export async function generatePlanInDb({
     deload_week8: false,
     test_week12: false,
     maxes: { squat: oneRMs.squat, bench: oneRMs.bench, deadlift: oneRMs.deadlift },
-    weaknesses: [`proficiency:${proficiency}`, `frequencyDays:${daysOfWeek.length}`, 'generator:static10w:v2'],
+    weaknesses: [`proficiency:${proficiency}`, `frequencyDays:${daysOfWeek.length}`, 'generator:static10w:v3'],
   })
 
   const exIds = await getMainLiftExerciseIds()
@@ -427,6 +525,7 @@ export async function generatePlanInDb({
         if (slot === 'primary') {
           const p = findPrimary(week, lift)
           const exName = competitionName(lift)
+
           await insertExerciseRow({
             workoutId,
             exerciseName: exName,
@@ -436,6 +535,7 @@ export async function generatePlanInDb({
             rpe: p.top.rpe,
             forceExerciseId: exIds.get(lift)!,
           })
+
           if (p.backoff) {
             await insertExerciseRow({
               workoutId,
@@ -453,22 +553,39 @@ export async function generatePlanInDb({
           const s = findSecondary(week, lift)
           if (s.sets <= 0) continue
           if (block === 'Peak' && lift === 'deadlift') continue // keep peak deadlift clean
+
           const exName = secondaryVariation(block, lift)
-          await insertExerciseRow({ workoutId, exerciseName: exName, baseLift: lift, sets: s.sets, reps: s.reps, rpe: s.rpe })
+          await insertExerciseRow({
+            workoutId,
+            exerciseName: exName,
+            baseLift: lift,
+            sets: s.sets,
+            reps: s.reps,
+            rpe: s.rpe,
+          })
         }
 
         if (slot === 'tertiary') {
           const t = findTertiary(week, lift)
           if (t.sets <= 0) continue
           if (block === 'Peak') continue
+
           const exName = tertiaryVariation(lift)
-          await insertExerciseRow({ workoutId, exerciseName: exName, baseLift: lift, sets: t.sets, reps: t.reps, rpe: t.rpe })
+          await insertExerciseRow({
+            workoutId,
+            exerciseName: exName,
+            baseLift: lift,
+            sets: t.sets,
+            reps: t.reps,
+            rpe: t.rpe,
+          })
         }
       }
     }
 
     const insertDeloadWeek = async (labelWeek: number) => {
       const deloadWeekId = await insertWeek(labelWeek, true)
+
       for (let dayIndex = 1; dayIndex <= dayCount; dayIndex++) {
         const dayName = daysOfWeek[dayIndex - 1]
         const workoutId = await insertDay(deloadWeekId, dayIndex, dayName)
